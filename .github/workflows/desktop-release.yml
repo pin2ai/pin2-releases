@@ -1,0 +1,149 @@
+name: Tested Pin2 desktop release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Protected GitLab release tag, also used for the GitHub release
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: pin2-stable-release
+  cancel-in-progress: false
+env:
+  PIN2_RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+jobs:
+  source:
+    runs-on: ubuntu-24.04
+    environment: release
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+      tag: ${{ steps.source.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@v4
+        with: {node-version: '24'}
+      - id: source
+        run: node bootstrap/fetch-source.mjs --resolve-only
+        env:
+          PIN2_SOURCE_USERNAME: ${{ vars.PIN2_SOURCE_USERNAME }}
+          PIN2_SOURCE_TOKEN: ${{ secrets.PIN2_SOURCE_TOKEN }}
+  tests:
+    needs: source
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2025]
+    runs-on: ${{ matrix.os }}
+    environment: release
+    env:
+      PIN2_SOURCE_SHA: ${{ needs.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@v4
+        with: {node-version: '24'}
+      - run: node bootstrap/fetch-source.mjs
+        env:
+          PIN2_SOURCE_USERNAME: ${{ vars.PIN2_SOURCE_USERNAME }}
+          PIN2_SOURCE_TOKEN: ${{ secrets.PIN2_SOURCE_TOKEN }}
+      - run: npm ci --no-audit --no-fund
+        working-directory: source
+      - run: npm run typecheck
+        working-directory: source
+      - run: npm test
+        working-directory: source
+      - run: npm run test:plugins
+        working-directory: source
+  mac:
+    needs: [source, tests]
+    runs-on: macos-15
+    timeout-minutes: 240
+    environment: release
+    env:
+      PIN2_SOURCE_SHA: ${{ needs.source.outputs.sha }}
+      PIN2_BUILD_CHANNEL: customer
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@v4
+        with: {node-version: '24'}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: node bootstrap/fetch-source.mjs
+        env:
+          PIN2_SOURCE_USERNAME: ${{ vars.PIN2_SOURCE_USERNAME }}
+          PIN2_SOURCE_TOKEN: ${{ secrets.PIN2_SOURCE_TOKEN }}
+      - name: Stage approved desktop OAuth clients
+        run: node ops/releases/stage-oauth.mjs
+        working-directory: source
+        env:
+          PIN2_DESKTOP_OAUTH_CLIENTS: ${{ secrets.PIN2_DESKTOP_OAUTH_CLIENTS }}
+      - run: |
+          test "$(uname -m)" = arm64
+          npm ci --no-audit --no-fund
+          npm --prefix desktop ci --no-audit --no-fund
+          npm --prefix editor ci --ignore-scripts --no-audit --no-fund
+          python -m pip install cmake pkgconf
+          node scripts/fetch_cliproxy.mjs --targets mac-arm64
+          VOICEHOST_FILE_AUDIO=0 VOICEHOST_TEST=1 bash scripts/build_voicehost_mac.sh
+          rm -rf dist/voicehost-build
+        working-directory: source
+      - name: Qualify the real updater, including rejection of tampered builds
+        run: node ops/releases/ci.mjs qualify
+        working-directory: source
+      - name: Import signing key into a temporary runner keychain
+        run: bash source/ops/releases/signing-keychain.sh setup
+        env:
+          PIN2_SIGNING_P12: ${{ secrets.PIN2_SIGNING_P12 }}
+          PIN2_SIGNING_P12_PASSWORD: ${{ secrets.PIN2_SIGNING_P12_PASSWORD }}
+          PIN2_APPLE_ID: ${{ vars.PIN2_APPLE_ID }}
+          PIN2_APPLE_APP_PASSWORD: ${{ secrets.PIN2_APPLE_APP_PASSWORD }}
+          PIN2_APPLE_TEAM: '49Q45FSU53'
+      - name: Build, sign, notarize and verify the customer release
+        run: |
+          rm -rf dist/updates
+          ATLAS_UPDATE_URL=https://github.com/pin2ai/pin2-releases/releases/latest/download/ NOTARY_PROFILE=pin2-release SKIP_BACKEND=1 bash scripts/build_mac_dmg.sh
+          node ops/releases/ci.mjs bundle
+        working-directory: source
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qualified-mac-arm64
+          path: source/dist/updates/
+          if-no-files-found: error
+          retention-days: 3
+      - name: Remove signing credentials
+        if: always()
+        run: if test -f source/ops/releases/signing-keychain.sh; then bash source/ops/releases/signing-keychain.sh cleanup; fi
+  publish:
+    needs: [source, tests, mac]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    env:
+      PIN2_SOURCE_SHA: ${{ needs.source.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with: {persist-credentials: false}
+      - uses: actions/setup-node@v4
+        with: {node-version: '24'}
+      - run: node bootstrap/fetch-source.mjs
+        env:
+          PIN2_SOURCE_USERNAME: ${{ vars.PIN2_SOURCE_USERNAME }}
+          PIN2_SOURCE_TOKEN: ${{ secrets.PIN2_SOURCE_TOKEN }}
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: source
+      - uses: actions/download-artifact@v4
+        with:
+          name: qualified-mac-arm64
+          path: source/dist/updates
+      - run: node ops/releases/publish.mjs
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PIN2_LEGACY_RELEASE_TOKEN: ${{ secrets.PIN2_LEGACY_RELEASE_TOKEN }}
